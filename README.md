@@ -51,7 +51,8 @@ pihost add <url-git> <sous-domaine> [options]  Clone, démarre, publie
       --branch <b>      branche git
       --name <n>        nom interne (défaut : sous-domaine)
       --keep-ports      conserve les ports publiés sur l'hôte
-pihost update <nom>                            git pull + rebuild + redémarrage
+pihost update <nom>                            git pull + rebuild + redémarrage (rien n'est supprimé)
+pihost update                                  Met à jour pihost lui-même (sans toucher aux conteneurs)
 pihost remove <nom> [--volumes]                Arrête et supprime (+ données avec --volumes)
 pihost list                                    Liste les applications
 pihost logs|restart|stop|start <nom>

@@ -266,14 +266,31 @@ cmd_add() {
   ok "$name déployé : https://$host  ->  $svc:$port"
 }
 
+PIHOST_RAW_URL="https://raw.githubusercontent.com/Vitrixxl/pihost/main/pihost"
+
+# Met à jour la CLI elle-même. Ne touche ni aux conteneurs, ni aux volumes, ni à la config.
+cmd_self_update() {
+  local self; self="$(readlink -f "${BASH_SOURCE[0]}")"
+  local tmp; tmp="$(mktemp)"
+  say "Téléchargement de la dernière version de pihost"
+  curl -fsSL "$PIHOST_RAW_URL" -o "$tmp" || { rm -f "$tmp"; die "Téléchargement impossible"; }
+  bash -n "$tmp" || { rm -f "$tmp"; die "Fichier téléchargé invalide, rien n'a été modifié"; }
+  if cmp -s "$tmp" "$self"; then rm -f "$tmp"; ok "pihost est déjà à jour"; return; fi
+  if [[ -w "$self" ]]; then install -m 0755 "$tmp" "$self"
+  else sudo install -m 0755 "$tmp" "$self"; fi
+  rm -f "$tmp"
+  ok "pihost mis à jour ($self). Les applications et Caddy n'ont pas été touchés."
+}
+
 cmd_update() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || { cmd_self_update; return; }
   load_config
-  local name="${1:-}"; [[ -n "$name" ]] || die "Usage : pihost update <nom>"
   load_app "$name"
   say "git pull dans $(app_repo "$name")"
   git -C "$(app_repo "$name")" pull --ff-only 2>&1 | sed 's/^/  /'
   say "Reconstruction et redémarrage"
-  compose "$name" up -d --build --quiet-pull --remove-orphans
+  compose "$name" up -d --build --quiet-pull
   ok "$name mis à jour : https://$HOST"
 }
 
@@ -346,7 +363,8 @@ pihost — héberge des projets Docker Compose derrière Caddy, un sous-domaine 
         --branch <b>      branche git
         --name <n>        nom interne (défaut : sous-domaine)
         --keep-ports      conserve les ports publiés sur l'hôte
-  pihost update <nom>                            git pull + rebuild + redémarrage
+  pihost update <nom>                            git pull + rebuild + redémarrage (rien n'est supprimé)
+  pihost update                                  Met à jour pihost lui-même (sans toucher aux conteneurs)
   pihost remove <nom> [--volumes]                Arrête et supprime (+ données avec --volumes)
   pihost list                                    Liste les applications
   pihost logs|restart|stop|start <nom>
@@ -360,6 +378,7 @@ TXT
 
 case "${1:-help}" in
   init|add|update|remove|list|logs|restart|stop|start|env|caddy) c="$1"; shift; "cmd_$c" "$@" ;;
+  self-update) cmd_self_update ;;
   rm) shift; cmd_remove "$@" ;;
   ls) shift; cmd_list "$@" ;;
   help|-h|--help) cmd_help ;;
