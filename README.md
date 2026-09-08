@@ -20,6 +20,14 @@ pihost add https://github.com/toi/cubix cubix     # => https://cubix.mondomaine.
 Le service et le port sont détectés depuis `ports:` ou `expose:` du compose du projet.
 S'il y a un doute, précise `--service` et `--port`.
 
+### Ports : rien à vérifier
+
+Les ports hôte des projets ne sont jamais ouverts, donc deux projets qui déclarent tous
+les deux `3000:3000` cohabitent sans conflit. Seuls 80 et 443 (Caddy) sont ouverts sur le Pi.
+
+Avec `--keep-ports`, pihost vérifie avant de démarrer que chaque port hôte demandé est libre
+et refuse le déploiement en indiquant qui l'occupe. `pihost list` affiche les ports hôte.
+
 ## Installation sur le Pi
 
 ```

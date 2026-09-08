@@ -163,6 +163,26 @@ detect_target() {
   echo "$svc $port"
 }
 
+# Ports hôte publiés par le compose du dépôt (uniquement utile avec --keep-ports).
+published_ports() {
+  local repo="$1"
+  local base; base="$(find_compose "$repo")" || return 0
+  docker compose --project-directory "$repo" -f "$base" config --format json 2>/dev/null \
+    | jq -r '.services[] | (.ports // [])[] | .published // empty' | sed 's/-.*//' | grep -E '^[0-9]+$' | sort -u
+}
+
+# Refuse si un port hôte demandé est déjà occupé sur le Pi (docker ou autre).
+check_host_ports() {
+  local repo="$1" p who conflicts=""
+  local used; used="$(ss -Hltn 2>/dev/null | awk '{print $4}' | sed 's/.*://' | sort -u)"
+  for p in $(published_ports "$repo"); do
+    grep -qx "$p" <<<"$used" || continue
+    who="$(docker ps --format '{{.Names}} {{.Ports}}' | grep -E "[:.]$p->" | awk '{print $1}' | head -1)"
+    conflicts+="  port $p : déjà utilisé par ${who:-un service hors docker}"$'\n'
+  done
+  [[ -z "$conflicts" ]] || die "Conflit de ports hôte, déploiement annulé :"$'\n'"$conflicts  Retire --keep-ports (Caddy n'en a pas besoin) ou change les ports dans le compose."
+}
+
 write_override() {
   local name="$1" svc="$2" keep_ports="$3"
   {
@@ -254,6 +274,11 @@ cmd_add() {
     "$name" "$url" "$host" "$svc" "$port" "$branch" "$keep_ports" > "$(app_meta "$name")"
   write_override "$name" "$svc" "$keep_ports"
 
+  if [[ "$keep_ports" == 1 ]]; then
+    say "Vérification des ports hôte"
+    ( check_host_ports "$repo" ) || { rm -rf "$dir"; exit 1; }
+  fi
+
   ensure_network
   say "Construction et démarrage (docker compose up -d --build)"
   compose "$name" up -d --build --quiet-pull
@@ -312,7 +337,7 @@ cmd_remove() {
 cmd_list() {
   load_config
   local any=0
-  printf '%-14s %-32s %-16s %s\n' NOM HOTE CIBLE ETAT
+  printf '%-14s %-32s %-14s %-12s %s\n' NOM HOTE CIBLE "PORTS HOTE" ETAT
   for meta in "$APPS"/*/app.env; do
     [[ -f "$meta" ]] || continue
     any=1
@@ -320,7 +345,8 @@ cmd_list() {
     ( source "$meta"
       state="$(docker ps --filter "label=com.docker.compose.project=pihost-$NAME" \
                 --filter "label=com.docker.compose.service=$SERVICE" --format '{{.Status}}' | head -1)"
-      printf '%-14s %-32s %-16s %s\n' "$NAME" "$HOST" "$SERVICE:$PORT" "${state:-arrêté}" )
+      hp="-"; [[ "${KEEP_PORTS:-0}" == 1 ]] && hp="$(published_ports "$(app_repo "$NAME")" | tr '\n' ',' | sed 's/,$//')"
+      printf '%-14s %-32s %-14s %-12s %s\n' "$NAME" "$HOST" "$SERVICE:$PORT" "${hp:--}" "${state:-arrêté}" )
   done
   [[ $any == 1 ]] || echo "(aucune application — pihost add <url-git> <sous-domaine>)"
 }
