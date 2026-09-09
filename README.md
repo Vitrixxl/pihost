@@ -64,7 +64,8 @@ pihost update                                  Met à jour pihost lui-même (san
 pihost remove <nom> [--volumes]                Arrête et supprime (+ données avec --volumes)
 pihost list                                    Liste les applications
 pihost logs|restart|stop|start <nom>
-pihost env <nom>                               Édite le .env puis redémarre
+pihost env <nom>                               Édite le .env (vim) puis redémarre
+pihost env <nom> --show                        Affiche le .env
 pihost caddy logs|reload|up|down
 ```
 

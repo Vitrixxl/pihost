@@ -358,9 +358,15 @@ cmd_start()   { load_config; local n="${1:-}"; [[ -n "$n" ]] || die "Usage : pih
 
 cmd_env() {
   load_config
-  local n="${1:-}"; [[ -n "$n" ]] || die "Usage : pihost env <nom>   (édite .env puis redémarre)"
+  local n="" show=0
+  for a in "$@"; do case "$a" in --show|-s|cat) show=1 ;; *) n="$a" ;; esac; done
+  [[ -n "$n" ]] || die "Usage : pihost env <nom> [--show]   (édite .env puis redémarre ; --show l'affiche seulement)"
   load_app "$n"
   local f; f="$(app_repo "$n")/.env"
+  if [[ $show == 1 ]]; then
+    [[ -f "$f" ]] || die "Pas de .env pour $n ($f)"
+    cat "$f"; return
+  fi
   "${EDITOR:-vim}" "$f"
   say "Redémarrage pour prendre en compte .env"
   compose "$n" up -d --quiet-pull
@@ -394,7 +400,8 @@ pihost — héberge des projets Docker Compose derrière Caddy, un sous-domaine 
   pihost remove <nom> [--volumes]                Arrête et supprime (+ données avec --volumes)
   pihost list                                    Liste les applications
   pihost logs|restart|stop|start <nom>
-  pihost env <nom>                               Édite le .env puis redémarre
+  pihost env <nom>                               Édite le .env (vim) puis redémarre
+  pihost env <nom> --show                        Affiche le .env
   pihost caddy logs|reload|up|down
 
 Le sous-domaine peut être "cubix" (=> cubix.<domaine>) ou un FQDN complet.
