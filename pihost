@@ -361,7 +361,7 @@ cmd_env() {
   local n="${1:-}"; [[ -n "$n" ]] || die "Usage : pihost env <nom>   (édite .env puis redémarre)"
   load_app "$n"
   local f; f="$(app_repo "$n")/.env"
-  "${EDITOR:-nano}" "$f"
+  "${EDITOR:-vim}" "$f"
   say "Redémarrage pour prendre en compte .env"
   compose "$n" up -d --quiet-pull
   ok "$n redémarré"
