@@ -218,8 +218,14 @@ CADDY
 }
 
 # ------------------------------------------------------------- dashboard ---
-# Retire d'éventuels identifiants d'une URL git (https://token@github.com/...).
-public_url() { sed -E 's#^([a-z+]+://)[^/@]*@#\1#' <<<"$1"; }
+# URL web publique d'un dépôt git : retire les identifiants (https://token@...), convertit
+# le SSH (git@host:chemin, ssh://) en https et les alias SSH (github.com-perso -> github.com).
+public_url() {
+  sed -E -e 's#^([a-z+]+://)[^/@]*@#\1#' \
+         -e 's#^[^@/:]+@([^:/]+):#https://\1/#' \
+         -e 's#^(git\+)?ssh://#https://#' \
+         -e 's#^(https?://(github\.com|gitlab\.com|bitbucket\.org|codeberg\.org))-[^/]+/#\1/#' <<<"$1"
+}
 
 # Génère la page, apps.json et le site Caddy du tableau de bord (sans recharger Caddy).
 # La page sonde chaque app via /_probe/<nom>/ : proxy same-origin vers le conteneur,
