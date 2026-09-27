@@ -67,10 +67,31 @@ pihost logs|restart|stop|start <nom>
 pihost env <nom>                               Édite le .env (vim) puis redémarre
 pihost env <nom> --show                        Affiche le .env
 pihost caddy logs|reload|up|down
+pihost dashboard <sous-domaine|@>              Publie le tableau de bord des applications
+pihost dashboard [off]                         Le régénère, ou le désactive
 ```
 
 Le sous-domaine peut être court (`cubix` => `cubix.<domaine>`) ou un nom complet
 (`app.autredomaine.fr`), utile pour un second domaine pointant vers le Pi.
+
+## Tableau de bord
+
+```
+pihost dashboard home      # => https://home.mondomaine.fr
+pihost dashboard @         # => https://mondomaine.fr
+```
+
+Une page qui liste toutes les applications avec leur favicon, le titre et la description
+de leur page d'accueil, leur état en direct (en ligne / hors ligne + latence, revérifié
+toutes les 30 s), la branche et le dernier commit déployé. Recherche avec `/`.
+
+Pour chaque app, la page passe par `/_probe/<nom>/` : Caddy relaie vers le conteneur,
+donc pas de souci de CORS pour lire l'état, le `<title>`, les `<link rel="icon">` et
+en déduire une couleur d'accent. Elle est régénérée automatiquement après `add`,
+`update` et `remove`. Les éventuels identifiants présents dans l'URL git sont retirés.
+
+La page est publique : n'active pas le tableau de bord si la liste de tes projets doit
+rester privée.
 
 ## Prérequis côté projet
 
@@ -83,8 +104,8 @@ Le sous-domaine peut être court (`cubix` => `cubix.<domaine>`) ou un nom comple
 
 ```
 /srv/pihost/
-├── config                 DOMAIN / EMAIL
-├── caddy/                 compose.yaml, Caddyfile, sites/*.caddy
+├── config                 DOMAIN / EMAIL / DASHBOARD
+├── caddy/                 compose.yaml, Caddyfile, sites/*.caddy, www/ (tableau de bord)
 └── apps/<nom>/
     ├── app.env            métadonnées (url, hôte, service, port)
     ├── override.yaml      override compose généré

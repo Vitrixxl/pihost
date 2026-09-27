@@ -7,6 +7,8 @@ CONF="$PIHOST_ROOT/config"
 APPS="$PIHOST_ROOT/apps"
 CADDY_DIR="$PIHOST_ROOT/caddy"
 SITES="$CADDY_DIR/sites"
+WWW="$CADDY_DIR/www"
+DASH_SITE="$SITES/_dashboard.caddy"
 NETWORK="pihost_web"
 CADDY_CONTAINER="pihost-caddy"
 
@@ -23,6 +25,10 @@ load_config() {
   # shellcheck disable=SC1090
   source "$CONF"
   [[ -n "${DOMAIN:-}" ]] || die "DOMAIN manquant dans $CONF"
+}
+
+write_config() {
+  printf 'DOMAIN=%q\nEMAIL=%q\nDASHBOARD=%q\n' "$DOMAIN" "${EMAIL:-}" "${DASHBOARD:-}" > "$CONF"
 }
 
 app_dir()   { echo "$APPS/$1"; }
@@ -89,6 +95,7 @@ services:
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ./sites:/etc/caddy/sites:ro
+      - ./www:/srv/www:ro
       - caddy_data:/data
       - caddy_config:/config
     networks:
@@ -210,14 +217,729 @@ $host {
 CADDY
 }
 
+# ------------------------------------------------------------- dashboard ---
+# Retire d'éventuels identifiants d'une URL git (https://token@github.com/...).
+public_url() { sed -E 's#^([a-z+]+://)[^/@]*@#\1#' <<<"$1"; }
+
+# Génère la page, apps.json et le site Caddy du tableau de bord (sans recharger Caddy).
+# La page sonde chaque app via /_probe/<nom>/ : proxy same-origin vers le conteneur,
+# ce qui donne l'état réel, le titre et le favicon sans souci de CORS.
+dashboard_write() {
+  [[ -n "${DASHBOARD:-}" ]] || return 0
+  mkdir -p "$WWW" "$SITES"
+  local meta probes=""
+  local json
+  json="$(for meta in "$APPS"/*/app.env; do
+      [[ -f "$meta" ]] || continue
+      # shellcheck disable=SC1090
+      ( source "$meta"
+        repo="$(app_repo "$NAME")"
+        c="$(git -C "$repo" log -1 --format='%h %cI' 2>/dev/null || true)"
+        b="$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "${BRANCH:-}")"
+        jq -n --arg name "$NAME" --arg host "$HOST" --arg repo "$(public_url "$URL")" --arg branch "$b" \
+          --arg commit "${c%% *}" --arg date "${c#* }" \
+          '{name:$name, host:$host, repo:$repo, branch:$branch, commit:$commit, date:$date}' )
+    done | jq -s --arg domain "$DOMAIN" --arg at "$(date -Iseconds)" \
+      '{domain:$domain, generated:$at, apps:sort_by(.name)}')"
+  printf '%s\n' "$json" > "$WWW/apps.json.tmp" && mv "$WWW/apps.json.tmp" "$WWW/apps.json"
+  dashboard_html > "$WWW/index.html"
+
+  for meta in "$APPS"/*/app.env; do
+    [[ -f "$meta" ]] || continue
+    # shellcheck disable=SC1090
+    probes+="$( source "$meta"
+      printf '    handle_path /_probe/%s/* {\n        reverse_proxy %s.pihost:%s {\n            header_up Host %s\n        }\n    }' \
+        "$NAME" "$NAME" "$PORT" "$HOST" )"$'\n'
+  done
+  {
+    echo "# Généré par pihost — tableau de bord (pihost dashboard)."
+    echo "$DASHBOARD {"
+    echo "    encode zstd gzip"
+    echo "    header X-Robots-Tag noindex"
+    printf '%s' "$probes"
+    echo "    handle /_probe/* {"
+    echo "        respond 404"
+    echo "    }"
+    echo "    handle {"
+    echo "        header Cache-Control no-cache"
+    echo "        root * /srv/www"
+    echo "        file_server"
+    echo "    }"
+    echo "}"
+  } > "$DASH_SITE"
+}
+
+# À appeler après tout changement d'applications. Sans effet si le tableau de bord est désactivé.
+dashboard_refresh() {
+  [[ -n "${DASHBOARD:-}" ]] || return 0
+  dashboard_write
+  caddy_reload || warn "Rechargement Caddy en échec (tableau de bord)"
+}
+
+dashboard_html() {
+  cat <<'DASHBOARD_HTML'
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<meta name="color-scheme" content="dark light">
+<title>pihost</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%238b5cf6'/%3E%3Cstop offset='1' stop-color='%2322d3ee'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='9' fill='url(%23g)'/%3E%3Cpath d='M8 11h16M12 11v12M20 11v9c0 2 1 3 3 3' stroke='white' stroke-width='2.6' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #07080d;
+    --fg: #eef0f6;
+    --muted: #8a90a3;
+    --faint: #555b6e;
+    --card: rgba(255, 255, 255, .035);
+    --card-hi: rgba(255, 255, 255, .06);
+    --line: rgba(255, 255, 255, .08);
+    --line-hi: rgba(255, 255, 255, .16);
+    --up: #34d399;
+    --warn: #fbbf24;
+    --down: #f43f5e;
+    --radius: 22px;
+    --sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, "JetBrains Mono", "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f5f6fa;
+      --fg: #0d1020;
+      --muted: #5b6275;
+      --faint: #9aa0b2;
+      --card: rgba(255, 255, 255, .7);
+      --card-hi: rgba(255, 255, 255, .95);
+      --line: rgba(13, 16, 32, .08);
+      --line-hi: rgba(13, 16, 32, .16);
+      --up: #059669;
+      --warn: #d97706;
+      --down: #e11d48;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font: 15px/1.5 var(--sans);
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+  a { color: inherit; text-decoration: none; }
+
+  /* ---------- fond : aurore + grille + grain ---------- */
+  .sky { position: fixed; inset: 0; z-index: -1; overflow: hidden; pointer-events: none; }
+  .blob {
+    position: absolute; width: 60vmax; height: 60vmax; border-radius: 50%;
+    filter: blur(90px); opacity: .28; mix-blend-mode: screen;
+    animation: drift 28s ease-in-out infinite alternate;
+  }
+  .blob.a { background: #7c3aed; top: -30vmax; left: -15vmax; }
+  .blob.b { background: #0ea5e9; top: -25vmax; right: -25vmax; animation-duration: 34s; animation-delay: -8s; }
+  .blob.c { background: #db2777; bottom: -40vmax; left: 20vmax; opacity: .16; animation-duration: 40s; animation-delay: -16s; }
+  @media (prefers-color-scheme: light) { .blob { mix-blend-mode: multiply; opacity: .14; } .blob.c { opacity: .08; } }
+  @keyframes drift {
+    0%   { transform: translate(0, 0) scale(1); }
+    50%  { transform: translate(6vmax, 4vmax) scale(1.08); }
+    100% { transform: translate(-4vmax, 8vmax) scale(.95); }
+  }
+  .grid-bg {
+    position: absolute; inset: 0;
+    background-image:
+      linear-gradient(var(--line) 1px, transparent 1px),
+      linear-gradient(90deg, var(--line) 1px, transparent 1px);
+    background-size: 56px 56px;
+    mask-image: radial-gradient(ellipse 80% 60% at 50% 0%, #000 30%, transparent 75%);
+    -webkit-mask-image: radial-gradient(ellipse 80% 60% at 50% 0%, #000 30%, transparent 75%);
+    opacity: .5;
+  }
+  .grain {
+    position: absolute; inset: -50%; opacity: .05;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  }
+
+  /* ---------- mise en page ---------- */
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 28px clamp(18px, 4vw, 40px) 64px; }
+
+  header.top { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+  .brand { display: flex; align-items: center; gap: 12px; font-weight: 600; letter-spacing: -.01em; }
+  .brand .logo {
+    width: 34px; height: 34px; border-radius: 11px; display: grid; place-items: center;
+    background: linear-gradient(135deg, #8b5cf6, #22d3ee);
+    box-shadow: 0 6px 24px -6px rgba(139, 92, 246, .7), inset 0 1px 0 rgba(255,255,255,.35);
+  }
+  .brand .logo svg { width: 20px; height: 20px; }
+  .brand small { display: block; font-weight: 500; color: var(--muted); font-size: 12.5px; font-family: var(--mono); }
+  .clock { font-family: var(--mono); color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+
+  .hero { margin: clamp(48px, 9vw, 96px) 0 34px; }
+  .hero h1 {
+    margin: 0; font-size: clamp(34px, 5.6vw, 60px); line-height: 1.04; letter-spacing: -.035em; font-weight: 700;
+  }
+  .hero h1 .grad {
+    display: inline-block; padding: 0 .08em .06em 0;
+    background: linear-gradient(100deg, #a78bfa 0%, #60a5fa 40%, #22d3ee 70%, #f472b6 100%);
+    background-size: 200% 100%;
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    animation: shine 9s ease-in-out infinite alternate;
+  }
+  @keyframes shine { to { background-position: 100% 0; } }
+  .hero p { margin: 14px 0 0; color: var(--muted); font-size: 16.5px; max-width: 56ch; }
+
+  .stats { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 26px; }
+  .stat {
+    display: inline-flex; align-items: center; gap: 9px; padding: 8px 14px 8px 12px;
+    border: 1px solid var(--line); border-radius: 999px; background: var(--card);
+    backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+    font-size: 13.5px; color: var(--muted);
+  }
+  .stat b { color: var(--fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  .toolbar { display: flex; gap: 10px; align-items: center; margin: 0 0 22px; }
+  .search {
+    flex: 1; position: relative; display: flex; align-items: center;
+  }
+  .search svg { position: absolute; z-index: 1; left: 15px; width: 17px; height: 17px; color: var(--faint); pointer-events: none; }
+  .search input {
+    width: 100%; height: 46px; padding: 0 52px 0 44px; font: inherit; color: var(--fg);
+    background: var(--card); border: 1px solid var(--line); border-radius: 14px; outline: none;
+    backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+    transition: border-color .2s, box-shadow .2s, background .2s;
+  }
+  .search input::placeholder { color: var(--faint); }
+  .search input:focus { border-color: var(--line-hi); background: var(--card-hi); box-shadow: 0 0 0 4px rgba(139, 92, 246, .15); }
+  .kbd {
+    position: absolute; right: 12px; font: 12px var(--mono); color: var(--faint);
+    border: 1px solid var(--line); border-radius: 6px; padding: 2px 7px;
+  }
+  .btn {
+    height: 46px; padding: 0 16px; display: inline-flex; align-items: center; gap: 8px;
+    font: inherit; font-size: 14px; color: var(--fg); cursor: pointer;
+    background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+    backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+    transition: border-color .2s, background .2s;
+  }
+  .btn:hover { border-color: var(--line-hi); background: var(--card-hi); }
+  .btn svg { width: 16px; height: 16px; }
+  .btn.spin svg { animation: rot .8s linear infinite; }
+  @keyframes rot { to { transform: rotate(360deg); } }
+  .btn .when { color: var(--muted); font-size: 12.5px; font-family: var(--mono); }
+
+  /* ---------- cartes ---------- */
+  .apps { display: grid; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: 16px; }
+
+  .card {
+    --accent: var(--app-accent, 250 85% 68%);
+    --mx: 50%; --my: 0%;
+    position: relative; display: flex; flex-direction: column; gap: 18px;
+    padding: 22px; border-radius: var(--radius);
+    background: var(--card);
+    border: 1px solid var(--line);
+    backdrop-filter: blur(16px) saturate(140%); -webkit-backdrop-filter: blur(16px) saturate(140%);
+    transition: transform .35s cubic-bezier(.2, .8, .2, 1), border-color .35s, box-shadow .35s, opacity .3s;
+    opacity: 0; transform: translateY(14px);
+    animation: rise .7s cubic-bezier(.2, .8, .2, 1) forwards;
+    animation-delay: calc(var(--i, 0) * 55ms);
+    isolation: isolate; overflow: hidden;
+  }
+  @keyframes rise { to { opacity: 1; transform: none; } }
+  .card::before {
+    /* halo qui suit la souris */
+    content: ""; position: absolute; inset: 0; z-index: -1; border-radius: inherit; opacity: 0;
+    background: radial-gradient(420px circle at var(--mx) var(--my), hsl(var(--accent) / .16), transparent 45%);
+    transition: opacity .35s;
+  }
+  .card::after {
+    /* liseré lumineux en haut */
+    content: ""; position: absolute; left: 22px; right: 22px; top: 0; height: 1px;
+    background: linear-gradient(90deg, transparent, hsl(var(--accent) / .7), transparent);
+    opacity: .35; transition: opacity .35s;
+  }
+  .card:hover, .card:focus-visible {
+    transform: translateY(-4px); border-color: hsl(var(--accent) / .45); outline: none;
+    box-shadow: 0 24px 60px -24px hsl(var(--accent) / .55), 0 0 0 1px hsl(var(--accent) / .12);
+  }
+  .card:hover::before, .card:focus-visible::before { opacity: 1; }
+  .card:hover::after { opacity: 1; }
+  .card.hidden { display: none; }
+  .card.is-down { --accent: 350 80% 62%; }
+
+  .head { display: flex; align-items: center; gap: 15px; min-width: 0; }
+  .icon {
+    position: relative; flex: none; width: 58px; height: 58px; border-radius: 17px;
+    display: grid; place-items: center;
+    background:
+      linear-gradient(145deg, hsl(var(--accent) / .22), hsl(var(--accent) / .06));
+    border: 1px solid hsl(var(--accent) / .28);
+    box-shadow: 0 10px 30px -10px hsl(var(--accent) / .65), inset 0 1px 0 rgba(255,255,255,.12);
+    transition: transform .45s cubic-bezier(.2, .8, .2, 1);
+  }
+  .card:hover .icon { transform: scale(1.06) rotate(-3deg); }
+  .icon img {
+    width: 34px; height: 34px; object-fit: contain; border-radius: 7px;
+    filter: drop-shadow(0 2px 6px rgba(0,0,0,.35));
+    opacity: 0; transform: scale(.7); transition: opacity .4s, transform .5s cubic-bezier(.2, .8, .2, 1);
+  }
+  .icon img.ok { opacity: 1; transform: none; }
+  .icon .mono {
+    font-weight: 700; font-size: 25px; letter-spacing: -.03em;
+    color: hsl(var(--accent));
+    text-shadow: 0 0 22px hsl(var(--accent) / .6);
+  }
+  .icon.shimmer::before {
+    content: ""; position: absolute; inset: 0; border-radius: inherit;
+    background: linear-gradient(110deg, transparent 30%, rgba(255,255,255,.12) 50%, transparent 70%);
+    background-size: 250% 100%; animation: shim 1.4s linear infinite;
+  }
+  @keyframes shim { from { background-position: 150% 0; } to { background-position: -100% 0; } }
+
+  .names { min-width: 0; flex: 1; }
+  .name { font-size: 18px; font-weight: 650; letter-spacing: -.02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .host { font: 13px var(--mono); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  .status {
+    flex: none; align-self: flex-start;
+    display: inline-flex; align-items: center; gap: 7px;
+    font-size: 12px; font-weight: 550; padding: 5px 10px 5px 9px; border-radius: 999px;
+    color: var(--muted); background: rgba(127, 127, 127, .1); border: 1px solid var(--line);
+    font-variant-numeric: tabular-nums; white-space: nowrap;
+  }
+  .dot { position: relative; width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }
+  .status.up   { color: var(--up);   background: color-mix(in srgb, var(--up) 10%, transparent);   border-color: color-mix(in srgb, var(--up) 25%, transparent); }
+  .status.warn { color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, transparent); border-color: color-mix(in srgb, var(--warn) 25%, transparent); }
+  .status.down { color: var(--down); background: color-mix(in srgb, var(--down) 10%, transparent); border-color: color-mix(in srgb, var(--down) 25%, transparent); }
+  .status.up .dot, .status.warn .dot, .status.down .dot { background: currentColor; }
+  .status.up .dot::after, .status.down .dot::after {
+    content: ""; position: absolute; inset: 0; border-radius: 50%; background: currentColor;
+    animation: ping 2.2s cubic-bezier(0, 0, .2, 1) infinite;
+  }
+  .status.pending .dot { animation: blink 1s ease-in-out infinite; }
+  @keyframes ping { 75%, 100% { transform: scale(2.6); opacity: 0; } }
+  @keyframes blink { 50% { opacity: .3; } }
+
+  .desc {
+    color: var(--muted); font-size: 14px; min-height: 42px;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .desc em { font-style: normal; color: var(--faint); }
+
+  .foot {
+    display: flex; align-items: center; gap: 8px;
+    padding-top: 16px; border-top: 1px dashed var(--line); margin-top: auto; min-width: 0;
+    font: 12px var(--mono); color: var(--muted);
+  }
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px; padding: 3px 8px; border-radius: 7px;
+    background: rgba(127, 127, 127, .09); border: 1px solid var(--line); max-width: 100%;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 0 1 auto;
+  }
+  .chip.branch { flex-shrink: 0; max-width: 40%; }
+  .chip > span { overflow: hidden; text-overflow: ellipsis; }
+  .chip svg { width: 12px; height: 12px; flex: none; opacity: .8; }
+  a.chip:hover { color: var(--fg); border-color: var(--line-hi); }
+  .open {
+    margin-left: auto; flex: none; display: inline-flex; align-items: center; gap: 5px;
+    color: hsl(var(--accent)); font-family: var(--sans); font-weight: 600; font-size: 13px;
+    transition: gap .25s;
+  }
+  .card:hover .open { gap: 9px; }
+  .open svg { width: 14px; height: 14px; }
+
+  .empty {
+    grid-column: 1 / -1; text-align: center; padding: 70px 20px; color: var(--muted);
+    border: 1px dashed var(--line-hi); border-radius: var(--radius); background: var(--card);
+  }
+  .empty code { font-family: var(--mono); color: var(--fg); background: rgba(127,127,127,.12); padding: 3px 8px; border-radius: 7px; }
+
+  footer { margin-top: 48px; text-align: center; color: var(--faint); font-size: 12.5px; font-family: var(--mono); }
+  footer a:hover { color: var(--muted); }
+
+  @media (max-width: 560px) {
+    .btn .label, .btn .when, .clock { display: none; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+    .card { opacity: 1; transform: none; }
+  }
+</style>
+</head>
+<body>
+<div class="sky" aria-hidden="true">
+  <div class="blob a"></div><div class="blob b"></div><div class="blob c"></div>
+  <div class="grid-bg"></div><div class="grain"></div>
+</div>
+
+<div class="wrap">
+  <header class="top">
+    <div class="brand">
+      <div class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round"><path d="M5 8h14M9 8v11M15 8v8c0 2 1 3 3 3"/></svg></div>
+      <div>pihost<small id="domain">…</small></div>
+    </div>
+    <div class="clock" id="clock"></div>
+  </header>
+
+  <section class="hero">
+    <h1>Tout ce qui tourne<br>sur <span class="grad" id="hero-host">ce Pi</span>.</h1>
+    <p id="hero-sub">Chargement des applications…</p>
+    <div class="stats">
+      <span class="stat"><span class="dot" style="background:var(--up)"></span><b id="n-up">–</b> en ligne</span>
+      <span class="stat"><span class="dot" style="background:var(--down)"></span><b id="n-down">–</b> hors ligne</span>
+      <span class="stat"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M13 2 3 14h9l-1 8 10-12h-9z"/></svg><b id="n-ms">–</b> latence moy.</span>
+    </div>
+  </section>
+
+  <div class="toolbar">
+    <label class="search">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <input id="q" type="search" placeholder="Rechercher une application…" autocomplete="off" spellcheck="false">
+      <span class="kbd">/</span>
+    </label>
+    <button class="btn" id="refresh" type="button" title="Revérifier maintenant">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>
+      <span class="label">Actualiser</span><span class="when" id="when"></span>
+    </button>
+  </div>
+
+  <main class="apps" id="apps"></main>
+
+  <footer>propulsé par <a href="https://github.com/Vitrixxl/pihost">pihost</a> · caddy · docker compose</footer>
+</div>
+
+<script>
+"use strict";
+const $ = (s) => document.querySelector(s);
+const REFRESH_MS = 30000;
+const TIMEOUT_MS = 8000;
+const cards = new Map();   // nom -> { el, app, status, ms, meta }
+
+const ICONS = {
+  branch: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="7" r="2"/><path d="M6 7v10M18 9c0 5-6 4-11.5 8.5"/></svg>',
+  commit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3.5"/><path d="M3 12h5.5M15.5 12H21"/></svg>',
+  arrow:  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M7 17 17 7M8 7h9v9"/></svg>',
+};
+
+function h(tag, cls, text) {
+  const el = document.createElement(tag);
+  if (cls) el.className = cls;
+  if (text != null) el.textContent = text;
+  return el;
+}
+
+function hashHue(s) {
+  let x = 0;
+  for (const c of s) x = (x * 31 + c.charCodeAt(0)) >>> 0;
+  return x % 360;
+}
+
+const rtf = new Intl.RelativeTimeFormat("fr", { numeric: "auto", style: "short" });
+function ago(iso) {
+  const d = (new Date(iso) - Date.now()) / 1000;
+  if (!isFinite(d)) return "";
+  const steps = [[60, "second"], [3600, "minute"], [86400, "hour"], [604800, "day"], [2629800, "week"], [31557600, "month"], [Infinity, "year"]];
+  const div = { second: 1, minute: 60, hour: 3600, day: 86400, week: 604800, month: 2629800, year: 31557600 };
+  for (const [lim, unit] of steps) if (Math.abs(d) < lim) return rtf.format(Math.round(d / div[unit]), unit);
+}
+
+/* ---------- couleurs ---------- */
+function rgbToHsl(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), l = (mx + mn) / 2;
+  if (mx === mn) return [0, 0, l];
+  const d = mx - mn, s = l > .5 ? d / (2 - mx - mn) : d / (mx + mn);
+  const hh = mx === r ? (g - b) / d + (g < b ? 6 : 0) : mx === g ? (b - r) / d + 2 : (r - g) / d + 4;
+  return [hh * 60, s, l];
+}
+// Rend une couleur lisible sur le fond : on garde la teinte, on normalise saturation et luminosité.
+function accentFrom(r, g, b) {
+  const [hh, s] = rgbToHsl(r, g, b);
+  if (s < .18) return null;
+  const light = matchMedia("(prefers-color-scheme: light)").matches;
+  return `${Math.round(hh)} ${Math.round(Math.max(s, .6) * 100)}% ${light ? 48 : 66}%`;
+}
+function accentFromCss(css) {
+  const probe = h("i"); probe.style.color = css; document.body.append(probe);
+  const m = getComputedStyle(probe).color.match(/[\d.]+/g); probe.remove();
+  return m ? accentFrom(+m[0], +m[1], +m[2]) : null;
+}
+function accentFromImage(img) {
+  try {
+    const n = 24, c = document.createElement("canvas"); c.width = c.height = n;
+    const x = c.getContext("2d", { willReadFrequently: true });
+    x.drawImage(img, 0, 0, n, n);
+    const d = x.getImageData(0, 0, n, n).data;
+    let r = 0, g = 0, b = 0, w = 0;
+    for (let i = 0; i < d.length; i += 4) {
+      if (d[i + 3] < 128) continue;
+      const mx = Math.max(d[i], d[i + 1], d[i + 2]), mn = Math.min(d[i], d[i + 1], d[i + 2]);
+      const sat = mx ? (mx - mn) / mx : 0, lum = (mx + mn) / 510;
+      const wt = sat * sat * (lum > .12 && lum < .92 ? 1 : .05);
+      r += d[i] * wt; g += d[i + 1] * wt; b += d[i + 2] * wt; w += wt;
+    }
+    return w > 1.5 ? accentFrom(r / w, g / w, b / w) : null;
+  } catch { return null; }
+}
+
+/* ---------- rendu ---------- */
+function makeCard(app, i) {
+  const el = h("a", "card");
+  el.href = `https://${app.host}/`;
+  el.target = "_blank"; el.rel = "noopener";
+  el.style.setProperty("--i", i);
+  el.style.setProperty("--app-accent", `${hashHue(app.name)} 85% 68%`);
+
+  const head = h("div", "head");
+  const icon = h("div", "icon shimmer");
+  icon.append(h("span", "mono", app.name.charAt(0).toUpperCase()));
+  const names = h("div", "names");
+  names.append(h("div", "name", app.name), h("div", "host", app.host));
+  const status = h("span", "status pending");
+  status.append(h("span", "dot"), h("span", "st", "vérification"));
+  head.append(icon, names, status);
+
+  const desc = h("div", "desc");
+  desc.innerHTML = "<em>…</em>";
+
+  const foot = h("div", "foot");
+  if (app.branch) {
+    const c = h("span", "chip branch"); c.innerHTML = ICONS.branch; c.append(h("span", null, app.branch)); foot.append(c);
+  }
+  if (app.commit) {
+    const c = h(app.repo ? "a" : "span", "chip");
+    c.innerHTML = ICONS.commit; c.append(h("span", null, app.commit + (app.date ? " · " + ago(app.date) : "")));
+    if (app.date) c.title = "Déployé le " + new Date(app.date).toLocaleString("fr-FR");
+    if (app.repo) {
+      c.href = app.repo.replace(/^git@([^:]+):/, "https://$1/").replace(/\.git$/, ""); c.target = "_blank"; c.rel = "noopener";
+      c.addEventListener("click", (e) => e.stopPropagation());
+    }
+    foot.append(c);
+  }
+  const open = h("span", "open"); open.append("Ouvrir"); open.insertAdjacentHTML("beforeend", ICONS.arrow);
+  foot.append(open);
+
+  el.append(head, desc, foot);
+  el.addEventListener("pointermove", (e) => {
+    const r = el.getBoundingClientRect();
+    el.style.setProperty("--mx", `${e.clientX - r.left}px`);
+    el.style.setProperty("--my", `${e.clientY - r.top}px`);
+  });
+  return { el, app, icon, status, desc, state: "pending", ms: null, meta: false, accentLocked: false };
+}
+
+function setStatus(c, state, ms, code) {
+  c.state = state; c.ms = ms;
+  c.status.className = "status " + state;
+  const txt = { up: `${ms} ms`, warn: `HTTP ${code}`, down: "hors ligne", pending: "vérification" }[state];
+  c.status.querySelector(".st").textContent = txt;
+  c.el.classList.toggle("is-down", state === "down");
+  if (state === "down" && !c.meta) {
+    c.icon.classList.remove("shimmer");
+    c.desc.innerHTML = "<em>Le service ne répond pas.</em>";
+  }
+  summary();
+}
+
+function summary() {
+  const all = [...cards.values()];
+  const up = all.filter((c) => c.state === "up" || c.state === "warn");
+  $("#n-up").textContent = up.length;
+  $("#n-down").textContent = all.filter((c) => c.state === "down").length;
+  const ms = up.map((c) => c.ms).filter((x) => x != null);
+  $("#n-ms").textContent = ms.length ? Math.round(ms.reduce((a, b) => a + b, 0) / ms.length) + " ms" : "–";
+}
+
+/* ---------- sondes (via le proxy same-origin de Caddy) ---------- */
+const probeBase = (app) => `/_probe/${encodeURIComponent(app.name)}/`;
+
+// URL d'une ressource de l'app ; si elle est sur l'hôte de l'app, on passe par le proxy (same-origin).
+function viaProbe(app, href) {
+  let u;
+  try { u = new URL(href, `https://${app.host}/`); } catch { return null; }
+  if (u.host === app.host) return probeBase(app) + u.pathname.replace(/^\//, "") + u.search;
+  return u.protocol === "https:" || u.protocol === "data:" ? u.href : null;
+}
+
+function iconCandidates(app, doc) {
+  const scored = [];
+  if (doc) {
+    for (const l of doc.querySelectorAll('link[rel~="icon" i], link[rel~="apple-touch-icon" i], link[rel~="apple-touch-icon-precomposed" i], link[rel~="mask-icon" i]')) {
+      const href = l.getAttribute("href"); if (!href) continue;
+      const rel = (l.getAttribute("rel") || "").toLowerCase();
+      const sizes = (l.getAttribute("sizes") || "").toLowerCase();
+      let score = 32;
+      if (rel.includes("mask-icon")) score = 1;          // monochrome, en dernier recours
+      else if (sizes === "any" || /\.svg(\?|$)/i.test(href) || (l.getAttribute("type") || "").includes("svg")) score = 1000;
+      else if (sizes) score = Math.max(...sizes.split(/\s+/).map((s) => parseInt(s, 10) || 0));
+      else if (rel.includes("apple-touch")) score = 180;
+      if (score > 256 && score < 1000) score = 256 - score / 1000; // pas besoin d'énormes images
+      scored.push([score, href]);
+    }
+  }
+  scored.sort((a, b) => b[0] - a[0]);
+  const urls = scored.map(([, href]) => viaProbe(app, href)).filter(Boolean);
+  urls.push(probeBase(app) + "favicon.ico");
+  return [...new Set(urls)];
+}
+
+function loadImage(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.decoding = "async";
+    img.onload = () => (img.naturalWidth > 0 ? resolve(img) : reject());
+    img.onerror = reject;
+    img.src = src;
+  });
+}
+
+async function applyMeta(c, html) {
+  const doc = html ? new DOMParser().parseFromString(html, "text/html") : null;
+  const pick = (sel, attr) => doc?.querySelector(sel)?.getAttribute(attr)?.trim() || "";
+  const title = doc?.querySelector("title")?.textContent.trim() || "";
+  const desc = pick('meta[name="description" i]', "content") || pick('meta[property="og:description" i]', "content");
+  const theme = pick('meta[name="theme-color" i]', "content");
+
+  c.desc.textContent = "";
+  if (title) { const b = h("span", null, title); b.style.color = "var(--fg)"; c.desc.append(b); }
+  if (desc) c.desc.append((title ? " — " : "") + desc);
+  if (!title && !desc) c.desc.innerHTML = "<em>Aucune description.</em>";
+
+  if (theme) {
+    const a = accentFromCss(theme);
+    if (a) c.el.style.setProperty("--app-accent", a);
+  }
+
+  for (const src of iconCandidates(c.app, doc)) {
+    try {
+      const img = await loadImage(src);
+      img.alt = "";
+      c.icon.replaceChildren(img);
+      requestAnimationFrame(() => img.classList.add("ok"));
+      const a = accentFromImage(img);
+      if (a) c.el.style.setProperty("--app-accent", a);
+      break;
+    } catch { /* candidat suivant */ }
+  }
+  c.icon.classList.remove("shimmer");
+}
+
+async function probe(c) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS);
+  const t0 = performance.now();
+  try {
+    const r = await fetch(probeBase(c.app), { redirect: "manual", cache: "no-store", signal: ctl.signal });
+    const ms = Math.round(performance.now() - t0);
+    if ([502, 503, 504].includes(r.status)) return setStatus(c, "down");
+    setStatus(c, r.status >= 500 ? "warn" : "up", ms, r.status);
+    if (!c.meta) {
+      c.meta = true;
+      const html = r.type !== "opaqueredirect" && (r.headers.get("content-type") || "").includes("html") ? await r.text() : "";
+      await applyMeta(c, html);
+    }
+  } catch {
+    setStatus(c, "down");
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+let busy = false;
+async function probeAll() {
+  if (busy) return;
+  busy = true;
+  $("#refresh").classList.add("spin");
+  await Promise.all([...cards.values()].map(probe));
+  $("#refresh").classList.remove("spin");
+  $("#when").textContent = new Date().toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  busy = false;
+}
+
+/* ---------- recherche ---------- */
+function filter() {
+  const q = $("#q").value.trim().toLowerCase();
+  let shown = 0;
+  for (const c of cards.values()) {
+    const hay = (c.app.name + " " + c.app.host + " " + c.desc.textContent).toLowerCase();
+    const hit = !q || hay.includes(q);
+    c.el.classList.toggle("hidden", !hit);
+    shown += hit;
+  }
+  const none = $("#none");
+  if (none) none.remove();
+  if (!shown && cards.size) {
+    const e = h("div", "empty"); e.id = "none"; e.textContent = `Aucune application ne correspond à « ${q} ».`;
+    $("#apps").append(e);
+  }
+}
+
+/* ---------- démarrage ---------- */
+function tick() {
+  $("#clock").textContent = new Date().toLocaleString("fr-FR", { weekday: "long", hour: "2-digit", minute: "2-digit" });
+}
+
+async function main() {
+  tick(); setInterval(tick, 15000);
+  let data;
+  try {
+    data = await (await fetch("apps.json", { cache: "no-store" })).json();
+  } catch {
+    $("#hero-sub").textContent = "Impossible de lire apps.json.";
+    return;
+  }
+  const apps = data.apps || [];
+  $("#domain").textContent = data.domain || location.host;
+  $("#hero-host").textContent = data.domain || location.host;
+  document.title = `pihost · ${data.domain || location.host}`;
+  $("#hero-sub").textContent = apps.length
+    ? `${apps.length} application${apps.length > 1 ? "s" : ""} déployée${apps.length > 1 ? "s" : ""} derrière Caddy, chacune sur son sous-domaine, en HTTPS.`
+    : "Aucune application pour l'instant.";
+
+  const root = $("#apps");
+  if (!apps.length) {
+    root.innerHTML = '<div class="empty">Rien ici pour l\'instant.<br><br><code>pihost add &lt;url-git&gt; &lt;sous-domaine&gt;</code></div>';
+    summary();
+    return;
+  }
+  apps.forEach((app, i) => {
+    const c = makeCard(app, i);
+    cards.set(app.name, c);
+    root.append(c.el);
+  });
+  summary();
+  probeAll();
+  setInterval(() => { if (!document.hidden) probeAll(); }, REFRESH_MS);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) probeAll(); });
+}
+
+$("#refresh").addEventListener("click", probeAll);
+$("#q").addEventListener("input", filter);
+addEventListener("keydown", (e) => {
+  if (e.key === "/" && document.activeElement !== $("#q")) { e.preventDefault(); $("#q").focus(); }
+  else if (e.key === "Escape" && document.activeElement === $("#q")) { $("#q").value = ""; filter(); $("#q").blur(); }
+});
+main();
+</script>
+</body>
+</html>
+DASHBOARD_HTML
+}
+
 # ---------------------------------------------------------------- commands --
 cmd_init() {
   local domain="${1:-}" email="${2:-}"
   [[ -n "$domain" ]] || die "Usage : pihost init <domaine> [email]"
   need docker; need jq; need git
-  mkdir -p "$APPS" "$SITES"
-  printf 'DOMAIN=%q\nEMAIL=%q\n' "$domain" "$email" > "$CONF"
+  mkdir -p "$APPS" "$SITES" "$WWW"
+  DASHBOARD=""
+  # shellcheck disable=SC1090
+  [[ -f "$CONF" ]] && DASHBOARD="$(source "$CONF"; echo "${DASHBOARD:-}")"
+  DOMAIN="$domain"; EMAIL="$email"
+  write_config
   ensure_network
+  dashboard_write
   write_caddyfile
   write_caddy_compose
   [[ -f "$SITES/_default.caddy" ]] || cat > "$SITES/_default.caddy" <<'CADDY'
@@ -249,6 +971,7 @@ cmd_add() {
   [[ -n "$url" && -n "$sub" ]] || die "Usage : pihost add <url-git> <sous-domaine> [--service s] [--port p] [--branch b] [--name n] [--keep-ports]"
 
   local host; host="$(resolve_host "$sub")"
+  [[ "$host" == "${DASHBOARD:-}" ]] && die "$host est utilisé par le tableau de bord (pihost dashboard off pour le libérer)"
   [[ -n "$name" ]] || name="$(derive_name "$sub")"
   local dir; dir="$(app_dir "$name")"
   [[ -d "$dir" ]] && die "L'application '$name' existe déjà. Utilise : pihost update $name, ou pihost remove $name"
@@ -288,6 +1011,7 @@ cmd_add() {
     rm -f "$(app_site "$name")"
     die "Config Caddy invalide pour $host, site retiré. L'application tourne toujours (pihost logs $name)."
   fi
+  dashboard_refresh
   ok "$name déployé : https://$host  ->  $svc:$port"
 }
 
@@ -304,6 +1028,7 @@ cmd_self_update() {
   if [[ -w "$self" ]]; then install -m 0755 "$tmp" "$self"
   else sudo install -m 0755 "$tmp" "$self"; fi
   rm -f "$tmp"
+  "$self" dashboard >/dev/null 2>&1 || true   # régénère la page avec la nouvelle version, si activée
   ok "pihost mis à jour ($self). Les applications et Caddy n'ont pas été touchés."
 }
 
@@ -316,6 +1041,7 @@ cmd_update() {
   git -C "$(app_repo "$name")" pull --ff-only 2>&1 | sed 's/^/  /'
   say "Reconstruction et redémarrage"
   compose "$name" up -d --build --quiet-pull
+  dashboard_refresh
   ok "$name mis à jour : https://$HOST"
 }
 
@@ -331,6 +1057,7 @@ cmd_remove() {
   rm -f "$(app_site "$name")"
   caddy_reload || warn "Rechargement Caddy en échec"
   rm -rf "$(app_dir "$name")"
+  dashboard_refresh
   ok "$name supprimé$( [[ $purge == 1 ]] && echo ' (volumes inclus)' )"
 }
 
@@ -373,12 +1100,45 @@ cmd_env() {
   ok "$n redémarré"
 }
 
+cmd_dashboard() {
+  load_config
+  local arg="${1:-}"
+  case "$arg" in
+    "")
+      [[ -n "${DASHBOARD:-}" ]] || die "Tableau de bord désactivé. Active-le : pihost dashboard <sous-domaine>   (@ = $DOMAIN)"
+      dashboard_refresh
+      ok "Tableau de bord régénéré : https://$DASHBOARD" ;;
+    off|--off)
+      DASHBOARD=""; write_config
+      rm -f "$DASH_SITE"
+      caddy_reload || warn "Rechargement Caddy en échec"
+      ok "Tableau de bord désactivé" ;;
+    -*) die "Usage : pihost dashboard [<sous-domaine>|@|off]" ;;
+    *)
+      local host m
+      if [[ "$arg" == "@" ]]; then host="$DOMAIN"; else host="$(resolve_host "$arg")"; fi
+      for m in "$APPS"/*/app.env; do
+        [[ -f "$m" ]] || continue
+        # shellcheck disable=SC1090
+        ( source "$m"; [[ "$HOST" != "$host" ]] ) || die "$host est déjà utilisé par une application"
+      done
+      DASHBOARD="$host"; write_config
+      dashboard_write
+      # (Re)crée Caddy si besoin pour monter le dossier www.
+      say "Mise à jour de Caddy"
+      write_caddy_compose
+      caddy_compose up -d --quiet-pull 2>&1 | grep -v '^$' || true
+      local i; for i in 1 2 3 4 5; do caddy_reload && break; sleep 1; done
+      ok "Tableau de bord : https://$host" ;;
+  esac
+}
+
 cmd_caddy() {
   load_config
   case "${1:-}" in
     logs)   caddy_compose logs -f --tail=100 ;;
     reload) caddy_reload && ok "Caddy rechargé" ;;
-    up)     ensure_network; write_caddyfile; write_caddy_compose; caddy_compose up -d --quiet-pull; ok "Caddy démarré" ;;
+    up)     ensure_network; mkdir -p "$WWW"; write_caddyfile; write_caddy_compose; caddy_compose up -d --quiet-pull; ok "Caddy démarré" ;;
     down)   caddy_compose down ;;
     *) die "Usage : pihost caddy logs|reload|up|down" ;;
   esac
@@ -403,6 +1163,8 @@ pihost — héberge des projets Docker Compose derrière Caddy, un sous-domaine 
   pihost env <nom>                               Édite le .env (vim) puis redémarre
   pihost env <nom> --show                        Affiche le .env
   pihost caddy logs|reload|up|down
+  pihost dashboard <sous-domaine|@>              Publie le tableau de bord des applications
+  pihost dashboard [off]                         Le régénère, ou le désactive
 
 Le sous-domaine peut être "cubix" (=> cubix.<domaine>) ou un FQDN complet.
 Racine : $PIHOST_ROOT (variable PIHOST_ROOT)
@@ -410,7 +1172,7 @@ TXT
 }
 
 case "${1:-help}" in
-  init|add|update|remove|list|logs|restart|stop|start|env|caddy) c="$1"; shift; "cmd_$c" "$@" ;;
+  init|add|update|remove|list|logs|restart|stop|start|env|caddy|dashboard) c="$1"; shift; "cmd_$c" "$@" ;;
   self-update) cmd_self_update ;;
   rm) shift; cmd_remove "$@" ;;
   ls) shift; cmd_list "$@" ;;
