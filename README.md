@@ -83,7 +83,7 @@ pihost dashboard @         # => https://mondomaine.fr
 
 Une page qui liste toutes les applications avec leur favicon, le titre et la description
 de leur page d'accueil, leur état en direct (en ligne / hors ligne + latence, revérifié
-toutes les 30 s), la branche et le dernier commit déployé. Recherche avec `/`.
+toutes les 30 s) et un lien vers le dépôt GitHub.
 
 Pour chaque app, la page passe par `/_probe/<nom>/` : Caddy relaie vers le conteneur,
 donc pas de souci de CORS pour lire l'état, le `<title>`, les `<link rel="icon">` et
